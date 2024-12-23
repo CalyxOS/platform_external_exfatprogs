@@ -131,8 +131,8 @@ static int exfat_show_ondisk_all_info(struct exfat_blk_dev *bd)
 	exfat_info("Cluster Count: \t\t\t\t%u\n", total_clus);
 	exfat_info("Root Cluster (cluster offset): \t\t%u\n", root_clu);
 	exfat_info("Volume Serial: \t\t\t\t0x%x\n", le32_to_cpu(pbsx->vol_serial));
-	exfat_info("Sector Size Bits: \t\t\t%u\n", pbsx->sect_size_bits);
-	exfat_info("Sector per Cluster bits: \t\t%u\n\n", pbsx->sect_per_clus_bits);
+	exfat_info("Bytes per Sector: \t\t\t%u\n", 1 << pbsx->sect_size_bits);
+	exfat_info("Sectors per Cluster: \t\t\t%u\n\n", 1 << pbsx->sect_per_clus_bits);
 
 	bd->cluster_size =
 		1 << (pbsx->sect_per_clus_bits + pbsx->sect_size_bits);
@@ -223,6 +223,7 @@ int main(int argc, char *argv[])
 	bool version_only = false;
 
 	init_user_input(&ui);
+	ui.writeable = false;
 
 	if (!setlocale(LC_CTYPE, ""))
 		exfat_err("failed to init locale/codeset\n");
@@ -243,11 +244,10 @@ int main(int argc, char *argv[])
 	if (version_only)
 		exit(EXIT_FAILURE);
 
-	if (argc < 2)
+	if (argc - optind != 1)
 		usage();
 
-	memset(ui.dev_name, 0, sizeof(ui.dev_name));
-	snprintf(ui.dev_name, sizeof(ui.dev_name), "%s", argv[1]);
+	ui.dev_name = argv[1];
 
 	ret = exfat_get_blk_dev_info(&ui, &bd);
 	if (ret < 0)

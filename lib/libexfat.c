@@ -187,7 +187,9 @@ int exfat_get_blk_dev_info(struct exfat_user_input *ui,
 	if (!ui->boundary_align)
 		ui->boundary_align = DEFAULT_BOUNDARY_ALIGNMENT;
 
-	if (ioctl(fd, BLKSSZGET, &bd->sector_size) < 0)
+	if (ui->sector_size)
+		bd->sector_size = ui->sector_size;
+	else if (ioctl(fd, BLKSSZGET, &bd->sector_size) < 0)
 		bd->sector_size = DEFAULT_SECTOR_SIZE;
 	bd->sector_size_bits = sector_size_bits(bd->sector_size);
 	bd->num_sectors = blk_dev_size / bd->sector_size;
@@ -216,6 +218,24 @@ ssize_t exfat_read(int fd, void *buf, size_t size, off_t offset)
 ssize_t exfat_write(int fd, void *buf, size_t size, off_t offset)
 {
 	return pwrite(fd, buf, size, offset);
+}
+
+ssize_t exfat_write_zero(int fd, size_t size, off_t offset)
+{
+	const char zero_buf[4 * KB] = {0};
+
+	lseek(fd, offset, SEEK_SET);
+
+	while (size > 0) {
+		int iter_size = MIN(size, sizeof(zero_buf));
+
+		if (iter_size != write(fd, zero_buf, iter_size))
+			return -EIO;
+
+		size -= iter_size;
+	}
+
+	return 0;
 }
 
 size_t exfat_utf16_len(const __le16 *str, size_t max_size)
@@ -355,7 +375,7 @@ off_t exfat_get_root_entry_offset(struct exfat_blk_dev *bd)
 	unsigned int cluster_size, sector_size;
 	off_t root_clu_off;
 
-	bs = (struct pbr *)malloc(EXFAT_MAX_SECTOR_SIZE);
+	bs = malloc(EXFAT_MAX_SECTOR_SIZE);
 	if (!bs) {
 		exfat_err("failed to allocate memory\n");
 		return -ENOMEM;
@@ -412,6 +432,7 @@ int exfat_read_volume_label(struct exfat *exfat)
 	__le16 disk_label[VOLUME_LABEL_MAX_LEN];
 	struct exfat_lookup_filter filter = {
 		.in.type = EXFAT_VOLUME,
+		.in.dentry_count = 0,
 		.in.filter = NULL,
 	};
 
@@ -453,6 +474,7 @@ int exfat_set_volume_label(struct exfat *exfat, char *label_input)
 
 	struct exfat_lookup_filter filter = {
 		.in.type = EXFAT_VOLUME,
+		.in.dentry_count = 1,
 		.in.filter = NULL,
 	};
 
@@ -462,7 +484,7 @@ int exfat_set_volume_label(struct exfat *exfat, char *label_input)
 		dcount = filter.out.dentry_count;
 		memset(pvol->vol_label, 0, sizeof(pvol->vol_label));
 	} else {
-		pvol = calloc(sizeof(struct exfat_dentry), 1);
+		pvol = calloc(1, sizeof(struct exfat_dentry));
 		if (!pvol)
 			return -ENOMEM;
 
@@ -474,12 +496,20 @@ int exfat_set_volume_label(struct exfat *exfat, char *label_input)
 			volume_label, sizeof(volume_label));
 	if (volume_label_len < 0) {
 		exfat_err("failed to encode volume label\n");
-		free(pvol);
-		return -1;
+		err = -1;
+		goto out;
+	}
+
+	pvol->vol_char_cnt = volume_label_len/2;
+	err = exfat_check_name(volume_label, pvol->vol_char_cnt);
+	if (err != pvol->vol_char_cnt) {
+		exfat_err("volume label contain invalid character(%c)\n",
+				le16_to_cpu(label_input[err]));
+		err = -1;
+		goto out;
 	}
 
 	memcpy(pvol->vol_label, volume_label, volume_label_len);
-	pvol->vol_char_cnt = volume_label_len/2;
 
 	loc.parent = exfat->root;
 	loc.file_offset = filter.out.file_offset;
@@ -487,7 +517,169 @@ int exfat_set_volume_label(struct exfat *exfat, char *label_input)
 	err = exfat_add_dentry_set(exfat, &loc, pvol, dcount, false);
 	exfat_info("new label: %s\n", label_input);
 
+out:
 	free(pvol);
+
+	return err;
+}
+
+static inline void print_guid(const char *msg, const __u8 *guid)
+{
+	exfat_info("%s: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+			msg,
+			guid[0], guid[1], guid[2], guid[3],
+			guid[4], guid[5], guid[5], guid[7],
+			guid[8], guid[9], guid[10], guid[11],
+			guid[12], guid[13], guid[14], guid[15]);
+}
+
+static int set_guid(__u8 *guid, const char *input)
+{
+	int i, j, zero_len = 0;
+	int len = strlen(input);
+
+	if (len != EXFAT_GUID_LEN * 2 && len != EXFAT_GUID_LEN * 2 + 4) {
+		exfat_err("invalid format for volume guid\n");
+		return -EINVAL;
+	}
+
+	for (i = 0, j = 0; i < len; i++) {
+		unsigned char ch = input[i];
+
+		if (ch >= '0' && ch <= '9')
+			ch -= '0';
+		else if (ch >= 'a' && ch <= 'f')
+			ch -= 'a' - 0xA;
+		else if (ch >= 'A' && ch <= 'F')
+			ch -= 'A' - 0xA;
+		else if (ch == '-' && len == EXFAT_GUID_LEN * 2 + 4 &&
+			 (i == 8 || i == 13 || i == 18 || i == 23))
+			continue;
+		else {
+			exfat_err("invalid character '%c' for volume GUID\n", ch);
+			return -EINVAL;
+		}
+
+		if (j & 1)
+			guid[j >> 1] |= ch;
+		else
+			guid[j >> 1] = ch << 4;
+
+		j++;
+
+		if (ch == 0)
+			zero_len++;
+	}
+
+	if (zero_len == EXFAT_GUID_LEN * 2) {
+		exfat_err("%s is invalid for volume GUID\n", input);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+int exfat_read_volume_guid(struct exfat *exfat)
+{
+	int err;
+	uint16_t checksum = 0;
+	struct exfat_dentry *dentry;
+	struct exfat_lookup_filter filter = {
+		.in.type = EXFAT_GUID,
+		.in.dentry_count = 1,
+		.in.filter = NULL,
+	};
+
+	err = exfat_lookup_dentry_set(exfat, exfat->root, &filter);
+	if (err)
+		return err;
+
+	dentry = filter.out.dentry_set;
+	exfat_calc_dentry_checksum(dentry, &checksum, true);
+
+	if (cpu_to_le16(checksum) == dentry->dentry.guid.checksum)
+		print_guid("GUID", dentry->dentry.guid.guid);
+	else
+		exfat_info("GUID is corrupted, please delete it or set a new one\n");
+
+	free(dentry);
+
+	return err;
+}
+
+int __exfat_set_volume_guid(struct exfat_dentry *dentry, const char *guid)
+{
+	int err;
+	uint16_t checksum = 0;
+
+	memset(dentry, 0, sizeof(*dentry));
+	dentry->type = EXFAT_GUID;
+
+	err = set_guid(dentry->dentry.guid.guid, guid);
+	if (err)
+		return err;
+
+	exfat_calc_dentry_checksum(dentry, &checksum, true);
+	dentry->dentry.guid.checksum = cpu_to_le16(checksum);
+
+	return 0;
+}
+
+/*
+ * Create/Update/Delete GUID dentry in root directory
+ *
+ * create/update GUID if @guid is not NULL.
+ * delete GUID if @guid is NULL.
+ */
+int exfat_set_volume_guid(struct exfat *exfat, const char *guid)
+{
+	struct exfat_dentry *dentry;
+	struct exfat_dentry_loc loc;
+	int err;
+
+	struct exfat_lookup_filter filter = {
+		.in.type = EXFAT_GUID,
+		.in.dentry_count = 1,
+		.in.filter = NULL,
+	};
+
+	err = exfat_lookup_dentry_set(exfat, exfat->root, &filter);
+	if (!err) {
+		/* GUID entry is found */
+		dentry = filter.out.dentry_set;
+	} else {
+		/* no GUID to delete */
+		if (guid == NULL)
+			return 0;
+
+		dentry = calloc(1, sizeof(*dentry));
+		if (!dentry)
+			return -ENOMEM;
+	}
+
+	if (guid) {
+		/* Set GUID */
+		err = __exfat_set_volume_guid(dentry, guid);
+		if (err)
+			goto out;
+	} else {
+		/* Delete GUID */
+		dentry->type &= ~EXFAT_INVAL;
+	}
+
+	loc.parent = exfat->root;
+	loc.file_offset = filter.out.file_offset;
+	loc.dev_offset = filter.out.dev_offset;
+	err = exfat_add_dentry_set(exfat, &loc, dentry, 1, false);
+	if (!err) {
+		if (guid)
+			print_guid("new GUID", dentry->dentry.guid.guid);
+		else
+			exfat_info("GUID is deleted\n");
+	}
+
+out:
+	free(dentry);
 
 	return err;
 }
@@ -576,7 +768,7 @@ int exfat_show_volume_serial(int fd)
 		goto free_ppbr;
 	}
 
-	exfat_info("volume serial : 0x%x\n", ppbr->bsx.vol_serial);
+	exfat_info("volume serial : 0x%x\n", le32_to_cpu(ppbr->bsx.vol_serial));
 
 free_ppbr:
 	free(ppbr);
@@ -651,7 +843,7 @@ int exfat_set_volume_serial(struct exfat_blk_dev *bd,
 	}
 
 	bd->sector_size = 1 << ppbr->bsx.sect_size_bits;
-	ppbr->bsx.vol_serial = ui->volume_serial;
+	ppbr->bsx.vol_serial = cpu_to_le32(ui->volume_serial);
 
 	/* update main boot sector */
 	ret = exfat_write_sector(bd, (char *)ppbr, BOOT_SEC_IDX);
@@ -736,6 +928,8 @@ int exfat_set_fat(struct exfat *exfat, clus_t clus, clus_t next_clus)
 		exfat->bs->bsx.sect_size_bits;
 	offset += sizeof(clus_t) * clus;
 
+	next_clus = cpu_to_le32(next_clus);
+
 	if (exfat_write(exfat->blk_dev->dev_fd, &next_clus, sizeof(next_clus),
 			offset) != sizeof(next_clus))
 		return -EIO;
@@ -818,6 +1012,10 @@ int read_boot_sect(struct exfat_blk_dev *bdev, struct pbr **bs)
 	unsigned int sect_size, clu_size;
 
 	pbr = malloc(sizeof(struct pbr));
+	if (!pbr) {
+		exfat_err("failed to allocate memory\n");
+		return -ENOMEM;
+	}
 
 	if (exfat_read(bdev->dev_fd, pbr, sizeof(*pbr), 0) !=
 	    (ssize_t)sizeof(*pbr)) {
@@ -853,4 +1051,40 @@ int read_boot_sect(struct exfat_blk_dev *bdev, struct pbr **bs)
 err:
 	free(pbr);
 	return err;
+}
+
+int exfat_parse_ulong(const char *s, unsigned long *out)
+{
+	char *endptr;
+
+	errno = 0;
+
+	*out = strtoul(s, &endptr, 0);
+
+	if (errno)
+		return -errno;
+
+	if (s == endptr || *endptr != '\0')
+		return -EINVAL;
+
+	return 0;
+}
+
+static inline int check_bad_utf16_char(unsigned short w)
+{
+	return (w < 0x0020) || (w == '*') || (w == '?') || (w == '<') ||
+		(w == '>') || (w == '|') || (w == '"') || (w == ':') ||
+		(w == '/') || (w == '\\');
+}
+
+int exfat_check_name(__le16 *utf16_name, int len)
+{
+	int i;
+
+	for (i = 0; i < len; i++) {
+		if (check_bad_utf16_char(le16_to_cpu(utf16_name[i])))
+			break;
+	}
+
+	return i;
 }

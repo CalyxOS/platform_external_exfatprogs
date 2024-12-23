@@ -27,6 +27,12 @@ static struct path_resolve_ctx path_resolve_ctx;
 			##__VA_ARGS__);			\
 })
 
+static inline struct buffer_desc *exfat_de_iter_get_buffer(
+		struct exfat_de_iter *iter, unsigned int block)
+{
+	return &iter->buffer_desc[block % iter->exfat->buffer_count];
+}
+
 static ssize_t write_block(struct exfat_de_iter *iter, unsigned int block)
 {
 	off_t device_offset;
@@ -34,10 +40,10 @@ static ssize_t write_block(struct exfat_de_iter *iter, unsigned int block)
 	struct buffer_desc *desc;
 	unsigned int i;
 
-	desc = &iter->buffer_desc[block & 0x01];
+	desc = exfat_de_iter_get_buffer(iter, block);
 
 	for (i = 0; i < iter->read_size / iter->write_size; i++) {
-		if (desc->dirty[i]) {
+		if (BITMAP_GET(desc->dirty, i)) {
 			device_offset = exfat_c2o(exfat, desc->p_clus) +
 				desc->offset;
 			if (exfat_write(exfat->blk_dev->dev_fd,
@@ -46,7 +52,7 @@ static ssize_t write_block(struct exfat_de_iter *iter, unsigned int block)
 					device_offset + i * iter->write_size)
 					!= (ssize_t)iter->write_size)
 				return -EIO;
-			desc->dirty[i] = 0;
+			BITMAP_CLEAR(desc->dirty, i);
 		}
 	}
 	return 0;
@@ -169,7 +175,7 @@ static ssize_t read_block(struct exfat_de_iter *iter, unsigned int block)
 	off_t device_offset;
 	ssize_t ret;
 
-	desc = &iter->buffer_desc[block & 0x01];
+	desc = exfat_de_iter_get_buffer(iter, block);
 	if (block == 0) {
 		desc->p_clus = iter->parent->first_clus;
 		desc->offset = 0;
@@ -183,7 +189,7 @@ static ssize_t read_block(struct exfat_de_iter *iter, unsigned int block)
 		if (block > iter->parent->size / iter->read_size)
 			return EOF;
 
-		prev_desc = &iter->buffer_desc[(block-1) & 0x01];
+		prev_desc = exfat_de_iter_get_buffer(iter, block - 1);
 		if (prev_desc->offset + 2 * iter->read_size <=
 				exfat->clus_size) {
 			desc->p_clus = prev_desc->p_clus;
@@ -225,7 +231,7 @@ int exfat_de_iter_init(struct exfat_de_iter *iter, struct exfat *exfat,
 	iter->exfat = exfat;
 	iter->parent = dir;
 	iter->write_size = exfat->sect_size;
-	iter->read_size = exfat->clus_size <= 4*KB ? exfat->clus_size : 4*KB;
+	iter->read_size = exfat_get_read_size(exfat);
 	if (exfat->clus_size <= 32 * KB)
 		iter->ra_partial_size = MAX(4 * KB, exfat->clus_size / 2);
 	else
@@ -237,7 +243,7 @@ int exfat_de_iter_init(struct exfat_de_iter *iter, struct exfat *exfat,
 	iter->de_file_offset = 0;
 	iter->next_read_offset = iter->read_size;
 	iter->max_skip_dentries = 0;
-	iter->dot_name_num = 0;
+	iter->invalid_name_num = 0;
 
 	if (iter->parent->size == 0)
 		return EOF;
@@ -257,6 +263,7 @@ int exfat_de_iter_get(struct exfat_de_iter *iter,
 	off_t next_de_file_offset;
 	ssize_t ret;
 	unsigned int block;
+	struct buffer_desc *bd;
 
 	next_de_file_offset = iter->de_file_offset +
 			ith * sizeof(struct exfat_dentry);
@@ -265,9 +272,6 @@ int exfat_de_iter_get(struct exfat_de_iter *iter,
 	if (next_de_file_offset + sizeof(struct exfat_dentry) >
 		iter->parent->size)
 		return EOF;
-	/* the dentry must be in current, or next block which will be read */
-	if (block > iter->de_file_offset / iter->read_size + 1)
-		return -ERANGE;
 
 	/* read next cluster if needed */
 	if (next_de_file_offset >= iter->next_read_offset) {
@@ -280,8 +284,8 @@ int exfat_de_iter_get(struct exfat_de_iter *iter,
 	if (ith + 1 > iter->max_skip_dentries)
 		iter->max_skip_dentries = ith + 1;
 
-	*dentry = (struct exfat_dentry *)
-			(iter->buffer_desc[block & 0x01].buffer +
+	bd = exfat_de_iter_get_buffer(iter, block);
+	*dentry = (struct exfat_dentry *)(bd->buffer +
 			next_de_file_offset % iter->read_size);
 	return 0;
 }
@@ -292,6 +296,7 @@ int exfat_de_iter_get_dirty(struct exfat_de_iter *iter,
 	off_t next_file_offset;
 	unsigned int block;
 	int ret, sect_idx;
+	struct buffer_desc *bd;
 
 	ret = exfat_de_iter_get(iter, ith, dentry);
 	if (!ret) {
@@ -300,7 +305,8 @@ int exfat_de_iter_get_dirty(struct exfat_de_iter *iter,
 		block = (unsigned int)(next_file_offset / iter->read_size);
 		sect_idx = (int)((next_file_offset % iter->read_size) /
 				iter->write_size);
-		iter->buffer_desc[block & 0x01].dirty[sect_idx] = 1;
+		bd = exfat_de_iter_get_buffer(iter, block);
+		BITMAP_SET(bd->dirty, sect_idx);
 	}
 
 	return ret;
@@ -308,8 +314,11 @@ int exfat_de_iter_get_dirty(struct exfat_de_iter *iter,
 
 int exfat_de_iter_flush(struct exfat_de_iter *iter)
 {
-	if (write_block(iter, 0) || write_block(iter, 1))
-		return -EIO;
+	unsigned int i;
+
+	for (i = 0; i < iter->exfat->buffer_count; i++)
+		if (write_block(iter, i))
+			return -EIO;
 	return 0;
 }
 
@@ -333,7 +342,7 @@ off_t exfat_de_iter_device_offset(struct exfat_de_iter *iter)
 		return EOF;
 
 	block = iter->de_file_offset / iter->read_size;
-	bd = &iter->buffer_desc[block & 0x01];
+	bd = exfat_de_iter_get_buffer(iter, block);
 	return exfat_c2o(iter->exfat, bd->p_clus) + bd->offset +
 		iter->de_file_offset % iter->read_size;
 }
@@ -356,13 +365,15 @@ int exfat_lookup_dentry_set(struct exfat *exfat, struct exfat_inode *parent,
 	struct exfat_dentry *dentry = NULL;
 	off_t free_file_offset = 0, free_dev_offset = 0;
 	struct exfat_de_iter de_iter;
-	int dentry_count;
+	int dentry_count, empty_dentry_count = 0;
 	int retval;
-	bool last_is_free = false;
 
-	bd = exfat_alloc_buffer(2, exfat->clus_size, exfat->sect_size);
-	if (!bd)
-		return -ENOMEM;
+	if (!exfat->lookup_buffer) {
+		exfat->lookup_buffer = exfat_alloc_buffer(exfat);
+		if (!exfat->lookup_buffer)
+			return -ENOMEM;
+	}
+	bd = exfat->lookup_buffer;
 
 	retval = exfat_de_iter_init(&de_iter, exfat, parent, bd);
 	if (retval == EOF || retval)
@@ -377,6 +388,12 @@ int exfat_lookup_dentry_set(struct exfat *exfat, struct exfat_inode *parent,
 			fsck_err(parent->parent, parent,
 				 "failed to get a dentry. %d\n", retval);
 			goto out;
+		}
+
+		if (!IS_EXFAT_DELETED(dentry->type)) {
+			if (filter->in.dentry_count == 0 ||
+			    empty_dentry_count < filter->in.dentry_count)
+				empty_dentry_count = 0;
 		}
 
 		dentry_count = 1;
@@ -407,18 +424,17 @@ int exfat_lookup_dentry_set(struct exfat *exfat, struct exfat_inode *parent,
 			} else if (retval < 0) {
 				goto out;
 			}
-			last_is_free = false;
-		} else if ((dentry->type == EXFAT_LAST ||
-			    IS_EXFAT_DELETED(dentry->type))) {
-			if (!last_is_free) {
+		} else if (IS_EXFAT_DELETED(dentry->type)) {
+			if (empty_dentry_count == 0) {
 				free_file_offset =
 					exfat_de_iter_file_offset(&de_iter);
 				free_dev_offset =
 					exfat_de_iter_device_offset(&de_iter);
-				last_is_free = true;
 			}
-		} else {
-			last_is_free = false;
+
+			if (filter->in.dentry_count == 0 ||
+			    empty_dentry_count < filter->in.dentry_count)
+				empty_dentry_count++;
 		}
 
 		exfat_de_iter_advance(&de_iter, dentry_count);
@@ -430,15 +446,13 @@ out:
 			exfat_de_iter_file_offset(&de_iter);
 		filter->out.dev_offset =
 			exfat_de_iter_device_offset(&de_iter);
-	} else if (retval == EOF && last_is_free) {
+	} else if (retval == EOF && empty_dentry_count) {
 		filter->out.file_offset = free_file_offset;
 		filter->out.dev_offset = free_dev_offset;
 	} else {
 		filter->out.file_offset = exfat_de_iter_file_offset(&de_iter);
 		filter->out.dev_offset = EOF;
 	}
-	if (bd)
-		exfat_free_buffer(bd, 2);
 	return retval;
 }
 
@@ -472,7 +486,7 @@ static int filter_lookup_file(struct exfat_de_iter *de_iter,
 		if (retval || name_de->type != EXFAT_NAME)
 			return 1;
 
-		len = MIN(name_len, ENTRY_NAME_MAX);
+		len = MIN(name_len + 1, ENTRY_NAME_MAX);
 		if (memcmp(name_de->dentry.name.unicode_0_14,
 			   name, len * 2) != 0)
 			return 1;
@@ -482,6 +496,25 @@ static int filter_lookup_file(struct exfat_de_iter *de_iter,
 	}
 
 	*dentry_count = i;
+	return 0;
+}
+
+int exfat_lookup_file_by_utf16name(struct exfat *exfat,
+				 struct exfat_inode *parent,
+				 __le16 *utf16_name,
+				 struct exfat_lookup_filter *filter_out)
+{
+	int retval;
+
+	filter_out->in.type = EXFAT_FILE;
+	filter_out->in.filter = filter_lookup_file;
+	filter_out->in.param = utf16_name;
+	filter_out->in.dentry_count = 0;
+
+	retval = exfat_lookup_dentry_set(exfat, parent, filter_out);
+	if (retval < 0)
+		return retval;
+
 	return 0;
 }
 
@@ -495,15 +528,8 @@ int exfat_lookup_file(struct exfat *exfat, struct exfat_inode *parent,
 	if (retval < 0)
 		return retval;
 
-	filter_out->in.type = EXFAT_FILE;
-	filter_out->in.filter = filter_lookup_file;
-	filter_out->in.param = utf16_name;
-
-	retval = exfat_lookup_dentry_set(exfat, parent, filter_out);
-	if (retval < 0)
-		return retval;
-
-	return 0;
+	return exfat_lookup_file_by_utf16name(exfat, parent, utf16_name,
+			filter_out);
 }
 
 void exfat_calc_dentry_checksum(struct exfat_dentry *dentry,
@@ -514,12 +540,17 @@ void exfat_calc_dentry_checksum(struct exfat_dentry *dentry,
 
 	bytes = (uint8_t *)dentry;
 
-	*checksum = ((*checksum << 15) | (*checksum >> 1)) + bytes[0];
-	*checksum = ((*checksum << 15) | (*checksum >> 1)) + bytes[1];
+	/* use += to avoid promotion to int; UBSan complaints about signed overflow */
+	*checksum = (*checksum << 15) | (*checksum >> 1);
+	*checksum += bytes[0];
+	*checksum = (*checksum << 15) | (*checksum >> 1);
+	*checksum += bytes[1];
 
 	i = primary ? 4 : 2;
-	for (; i < sizeof(*dentry); i++)
-		*checksum = ((*checksum << 15) | (*checksum >> 1)) + bytes[i];
+	for (; i < sizeof(*dentry); i++) {
+		*checksum = (*checksum << 15) | (*checksum >> 1);
+		*checksum += bytes[i];
+	}
 }
 
 static uint16_t calc_dentry_set_checksum(struct exfat_dentry *dset, int dcount)
@@ -546,10 +577,12 @@ uint16_t exfat_calc_name_hash(struct exfat *exfat,
 
 	for (i = 0; i < len; i++) {
 		ch = exfat->upcase_table[le16_to_cpu(name[i])];
-		ch = cpu_to_le16(ch);
 
-		chksum = ((chksum << 15) | (chksum >> 1)) + (ch & 0xFF);
-		chksum = ((chksum << 15) | (chksum >> 1)) + (ch >> 8);
+		/* use += to avoid promotion to int; UBSan complaints about signed overflow */
+		chksum = (chksum << 15) | (chksum >> 1);
+		chksum += ch & 0xFF;
+		chksum = (chksum << 15) | (chksum >> 1);
+		chksum += ch >> 8;
 	}
 	return chksum;
 }
@@ -589,7 +622,7 @@ int exfat_build_file_dentry_set(struct exfat *exfat, const char *name,
 
 	name_len = retval / 2;
 	dcount = 2 + DIV_ROUND_UP(name_len, ENTRY_NAME_MAX);
-	dset = calloc(1, dcount * DENTRY_SIZE);
+	dset = calloc(dcount, DENTRY_SIZE);
 	if (!dset)
 		return -ENOMEM;
 
@@ -658,7 +691,7 @@ int exfat_update_file_dentry_set(struct exfat *exfat,
 
 		dset[1].dentry.stream.name_len = (__u8)name_len;
 		dset[1].dentry.stream.name_hash =
-			exfat_calc_name_hash(exfat, utf16_name, name_len);
+			cpu_to_le16(exfat_calc_name_hash(exfat, utf16_name, name_len));
 
 		for (i = 2; i < dcount; i++) {
 			dset[i].type = EXFAT_NAME;
@@ -678,7 +711,7 @@ int exfat_update_file_dentry_set(struct exfat *exfat,
 	return 0;
 }
 
-int exfat_find_free_cluster(struct exfat *exfat,
+static int find_free_cluster(struct exfat *exfat,
 			     clus_t start, clus_t *new_clu)
 {
 	clus_t end = le32_to_cpu(exfat->bs->bsx.clu_count) +
@@ -805,7 +838,7 @@ static int exfat_alloc_cluster(struct exfat *exfat, struct exfat_inode *inode,
 	if ((need_dset && !inode->dentry_set) || inode->is_contiguous)
 		return -EINVAL;
 
-	err = exfat_find_free_cluster(exfat, exfat->start_clu, new_clu);
+	err = find_free_cluster(exfat, exfat->start_clu, new_clu);
 	if (err) {
 		exfat->start_clu = EXFAT_FIRST_CLUSTER;
 		exfat_err("failed to find an free cluster\n");
@@ -817,9 +850,8 @@ static int exfat_alloc_cluster(struct exfat *exfat, struct exfat_inode *inode,
 		return -EIO;
 
 	/* zero out the new cluster */
-	if (exfat_write(exfat->blk_dev->dev_fd, exfat->zero_cluster,
-			exfat->clus_size, exfat_c2o(exfat, *new_clu)) !=
-	    (ssize_t)exfat->clus_size) {
+	if (exfat_write_zero(exfat->blk_dev->dev_fd, exfat->clus_size,
+				exfat_c2o(exfat, *new_clu))) {
 		exfat_err("failed to fill new cluster with zeroes\n");
 		return -EIO;
 	}

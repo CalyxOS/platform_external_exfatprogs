@@ -1,3 +1,73 @@
+exfatprogs 1.2.5 - released 2024-08-06
+======================================
+
+CHANGES :
+ * exfatprogs: remove the limitation that the device
+   path length cannot exceed 254 bytes.
+ * exfatprogs: include the test images in the release
+   package.
+
+NEW FEATURES :
+ * fsck.exfat: check and repair the filename which has
+   invalid characters.
+
+BUG FIXES :
+ * tune.exfat: check whether the volume has invalid
+   characters correctly.
+ * fsck.exfat: check whether the filename and volume
+   has invalid characters correctly.
+ * fsck.exfat: fix endianess issues which happen
+   in the big-endian system.
+
+exfatprogs 1.2.4 - released 2024-06-17
+======================================
+
+BUG FIXES :
+ * tune.exfat: Fix "invalid serial number" error when
+   setting an serial number.
+ * fsck.exfat: Fix memory leak in an error path
+
+exfatprogs 1.2.3 - released 2024-05-23
+======================================
+
+CHANGES :
+ * dump.exfat: Report sector size in bytes and cluster size in
+   terms of sectors.
+ * fsck.exfat: Show checksum value if the SetChecksum of File
+   directory entry is invalid.
+ * mkfs.exfat: Improve FAT length calculation to reduce
+   the FAT size.
+
+NEW FEATURES :
+ * mkfs.exfat: Add the option "--sector-size".
+ * fsck.exfat: Support checking and repairing VendorAllcation and
+   VendorExtension directory entries.
+
+BUG FIXES :
+ * exfatprogs: Remove unnecessary memory allocations.
+ * fsck.exfat: Fix corruption that can occur if the cluster size
+   is 512-byte.
+ * fsck.exfat: Fix the SecondaryCount of File directory entry
+   when the count of Name directory entries is 17 or higher.
+ * tune.exfat: Fix an error that accepts invalid serial numbers.
+
+exfatprogs 1.2.2 - released 2023-10-26
+======================================
+
+CHANGES :
+ * exfat2img: Allow dumps for read-only devices.
+ * fsck.exfat: Revert Repairing zero size directory.
+
+NEW FEATURES :
+ * fsck.exfat: Repair duplicated filename.
+ * mkfs.exfat: Add the option "q" to print only error messages.
+ * mkfs.exfat: Add the option "U" to set volume GUID.
+ * tune.exfat: Add the option "U" / "-u" to set or print volume GUID.
+
+BUG FIXES:
+ * fsck.exfat: Fix some out-of-bounds memory accesses.
+ * fsck.exfat: Change not to delete volume GUID directory entry.
+
 exfatprogs 1.2.1 - released 2023-05-17
 ======================================
 
