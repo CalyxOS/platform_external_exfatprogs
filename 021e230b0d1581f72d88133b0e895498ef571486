@@ -1,0 +1,21 @@
+{
+  "comments": [
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "7a5405de_27f8de4e",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 1000004
+      },
+      "writtenOn": "2026-08-04T18:55:02Z",
+      "side": 1,
+      "message": "Breaks mounting some large sdcards, hold until upstream fixes it.",
+      "revId": "021e230b0d1581f72d88133b0e895498ef571486",
+      "serverId": "35266860-6252-469c-a67d-185064479fc0"
+    }
+  ]
+}
